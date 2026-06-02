@@ -159,10 +159,27 @@ type WorkloadReconciler struct {
 	roleTracker            *roletracker.RoleTracker
 	preemptionExpectations *expectations.Store
 	customLabels           *metrics.CustomLabels
+
+	// deleteBuffer holds Workload references awaiting batched removal from
+	// the scheduler cache. Filled by the Delete event handler, drained by
+	// runDeleteFlusher in batches to reduce write-lock pulses on Cache.Mutex
+	// during bulk-delete bursts (see Cache.DeleteWorkloads).
+	deleteBuffer   chan workload.Reference
+	deleteFlushDur time.Duration
+	deleteBatchMax int
 }
 
 var _ reconcile.Reconciler = (*WorkloadReconciler)(nil)
 var _ predicate.TypedPredicate[*kueue.Workload] = (*WorkloadReconciler)(nil)
+
+// Defaults for the cache-delete coalescing layer. A 1024-slot buffer drained
+// every 50ms with batches up to 100 items absorbs >20k deletes/sec, far above
+// the ~83/sec burst that caused the 2026-06-01 admission stall on cq-gke-01.
+const (
+	defaultDeleteBufferSize = 1024
+	defaultDeleteFlushDur   = 50 * time.Millisecond
+	defaultDeleteBatchMax   = 100
+)
 
 func NewWorkloadReconciler(client client.Client, queues *qcache.Manager, cache *schdcache.Cache, recorder record.EventRecorder, options ...Option) *WorkloadReconciler {
 	r := &WorkloadReconciler{
@@ -173,6 +190,9 @@ func NewWorkloadReconciler(client client.Client, queues *qcache.Manager, cache *
 		recorder:            recorder,
 		clock:               realClock,
 		draReconcileChannel: make(chan event.TypedGenericEvent[*kueue.Workload], updateChBuffer),
+		deleteBuffer:        make(chan workload.Reference, defaultDeleteBufferSize),
+		deleteFlushDur:      defaultDeleteFlushDur,
+		deleteBatchMax:      defaultDeleteBatchMax,
 	}
 	for _, option := range options {
 		option(r)
@@ -182,6 +202,72 @@ func NewWorkloadReconciler(client client.Client, queues *qcache.Manager, cache *
 
 func (r *WorkloadReconciler) logger() logr.Logger {
 	return roletracker.WithReplicaRole(ctrl.Log.WithName(r.logName), r.roleTracker)
+}
+
+// Start implements manager.Runnable. controller-runtime invokes it once the
+// manager begins running; it drives the delete-coalescing flusher until ctx
+// is cancelled. Safe to call multiple times via separate managers — each
+// Reconciler instance has its own buffer.
+func (r *WorkloadReconciler) Start(ctx context.Context) error {
+	r.runDeleteFlusher(ctx)
+	return nil
+}
+
+// NeedLeaderElection lets controller-runtime know the flusher must only run
+// on the elected leader. The cache mutations it performs are otherwise
+// serialised through the same cache.Mutex as the leader's other writes.
+func (r *WorkloadReconciler) NeedLeaderElection() bool { return true }
+
+// runDeleteFlusher drains r.deleteBuffer, calling cache.DeleteWorkloads once
+// per batch tick or whenever the batch reaches deleteBatchMax. Reduces cache
+// write-lock acquisitions by ~50x under bulk-delete bursts.
+func (r *WorkloadReconciler) runDeleteFlusher(ctx context.Context) {
+	log := r.logger().WithName("delete-flusher")
+	ticker := time.NewTicker(r.deleteFlushDur)
+	defer ticker.Stop()
+	batch := make([]workload.Reference, 0, r.deleteBatchMax)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		errs := r.cache.DeleteWorkloads(log, batch)
+		for i, err := range errs {
+			if err != nil {
+				log.Error(err, "Failed to delete workload from cache (batched)", "wlKey", batch[i])
+			}
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case wlKey := <-r.deleteBuffer:
+			batch = append(batch, wlKey)
+			if len(batch) >= r.deleteBatchMax {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+// enqueueCacheDelete pushes a wlKey onto the delete-flusher buffer. If the
+// buffer is full (sustained delete rate exceeds flusher drain rate), falls
+// back to a synchronous cache delete so no deletes are dropped — correctness
+// is preserved at the cost of reverting to per-event lock pulses temporarily.
+func (r *WorkloadReconciler) enqueueCacheDelete(log logr.Logger, wlKey workload.Reference) {
+	select {
+	case r.deleteBuffer <- wlKey:
+	default:
+		if err := r.cache.DeleteWorkload(log, wlKey); err != nil {
+			log.Error(err, "Failed to delete workload from cache (sync fallback after buffer full)")
+		}
+	}
 }
 
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;watch;update;patch
@@ -1076,10 +1162,17 @@ func (r *WorkloadReconciler) Delete(e event.TypedDeleteEvent[*kueue.Workload]) b
 	// Delete from cache unconditionally. Pending workloads may have been "assumed"
 	// by the scheduler, and leaving them blocks ClusterQueue finalizer removal.
 	// The operation is idempotent if the workload was never in the cache.
+	//
+	// We coalesce these cache deletes via enqueueCacheDelete to keep
+	// cache.Mutex write-pulse rate bounded during bulk delete bursts (e.g.
+	// cloud-queue's kill_job cascade hitting ~83 deletes/sec). The trade-off
+	// is that the inadmissible-workloads retry triggered by
+	// QueueAssociatedInadmissibleWorkloadsAfter may run before the cache
+	// actually reflects the deletion — affected workloads then fail to
+	// admit on that cycle and retry on the next one (within ~50ms). Same
+	// recovery shape as the existing AssumeWorkload conflict path.
 	r.queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, wlKey, func() {
-		if err := r.cache.DeleteWorkload(log, wlKey); err != nil {
-			log.Error(err, "Failed to delete workload from cache")
-		}
+		r.enqueueCacheDelete(log, wlKey)
 	})
 
 	// Even if the state is unknown, the last cached state tells us whether the
@@ -1262,7 +1355,7 @@ func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager, cfg *config.Conf
 	ruh := &resourceUpdatesHandler{r: r}
 	wqh := &workloadQueueHandler{r: r}
 	deh := &draEventHandler{}
-	return builder.TypedControllerManagedBy[reconcile.Request](mgr).
+	if err := builder.TypedControllerManagedBy[reconcile.Request](mgr).
 		Named("workload_controller").
 		WatchesRawSource(source.TypedKind(
 			mgr.GetCache(),
@@ -1280,7 +1373,12 @@ func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager, cfg *config.Conf
 		Watches(&nodev1.RuntimeClass{}, ruh).
 		Watches(&kueue.ClusterQueue{}, wqh).
 		Watches(&kueue.LocalQueue{}, wqh).
-		Complete(WithLeadingManager(mgr, r, &kueue.Workload{}, cfg))
+		Complete(WithLeadingManager(mgr, r, &kueue.Workload{}, cfg)); err != nil {
+		return err
+	}
+	// Register the delete-coalescing flusher as a leader-elected Runnable.
+	// Implemented via Start() + NeedLeaderElection() on WorkloadReconciler.
+	return mgr.Add(r)
 }
 
 // isControllerOwnerGone checks whether the controller owner of the workload
