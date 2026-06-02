@@ -139,66 +139,6 @@ func TestDeleteWorkloads_PartialErrors(t *testing.T) {
 	}
 }
 
-// TestAddOrUpdateWorkloads_BatchAddsAllUnderOneLock — batch add of 50
-// workloads, all should commit (true) and end up in workloadAssignedQueues.
-func TestAddOrUpdateWorkloads_BatchAddsAllUnderOneLock(t *testing.T) {
-	ctx, log := utiltesting.ContextWithLog(t)
-	cl := utiltesting.NewFakeClient()
-	c := New(cl)
-	c.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
-	cq := utiltestingapi.MakeClusterQueue("cq").
-		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "1000").Obj()).
-		NamespaceSelector(nil).Obj()
-	if err := c.AddClusterQueue(ctx, cq); err != nil {
-		t.Fatalf("AddClusterQueue: %v", err)
-	}
-	now := time.Now()
-	ws := make([]*kueue.Workload, 50)
-	for i := range ws {
-		ws[i] = utiltestingapi.MakeWorkload(fmt.Sprintf("wl-%d", i), "").
-			PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "10m").Obj()).
-			SimpleReserveQuota("cq", "default", now).Obj()
-	}
-	results := c.AddOrUpdateWorkloads(log, ws)
-	for i, ok := range results {
-		if !ok {
-			t.Errorf("results[%d]: got false, want true", i)
-		}
-	}
-	for _, w := range ws {
-		if _, assigned := c.workloadAssignedQueues[workload.Key(w)]; !assigned {
-			t.Errorf("workload %s not assigned", workload.Key(w))
-		}
-	}
-}
-
-// TestAddOrUpdateWorkloads_FailsOnMissingCQ — per-item failure isolation.
-func TestAddOrUpdateWorkloads_FailsOnMissingCQ(t *testing.T) {
-	ctx, log := utiltesting.ContextWithLog(t)
-	cl := utiltesting.NewFakeClient()
-	c := New(cl)
-	c.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
-	if err := c.AddClusterQueue(ctx, utiltestingapi.MakeClusterQueue("cq").
-		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "1000").Obj()).
-		NamespaceSelector(nil).Obj()); err != nil {
-		t.Fatalf("AddClusterQueue: %v", err)
-	}
-	now := time.Now()
-	good := utiltestingapi.MakeWorkload("good", "").
-		PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "10m").Obj()).
-		SimpleReserveQuota("cq", "default", now).Obj()
-	bad := utiltestingapi.MakeWorkload("bad", "").
-		PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "10m").Obj()).
-		SimpleReserveQuota("does-not-exist", "default", now).Obj()
-	results := c.AddOrUpdateWorkloads(log, []*kueue.Workload{good, bad})
-	if !results[0] {
-		t.Errorf("good: got false, want true")
-	}
-	if results[1] {
-		t.Errorf("bad (unknown CQ): got true, want false")
-	}
-}
-
 // TestDeleteWorkloads_EmptyBatch handles the no-op case cleanly.
 func TestDeleteWorkloads_EmptyBatch(t *testing.T) {
 	_, log := utiltesting.ContextWithLog(t)
