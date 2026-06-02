@@ -676,6 +676,29 @@ func (c *Cache) AddOrUpdateWorkload(log logr.Logger, w *kueue.Workload) bool {
 	return updated
 }
 
+// AddOrUpdateWorkloads commits a batch of workloads to the cache under a
+// single write-lock acquisition. Per-item bool follows the same semantics
+// as AddOrUpdateWorkload (true if added/updated, false if no active quota
+// reservation or CQ not found). Designed for the scheduler's end-of-cycle
+// admission path to amortise the cache write lock across all admissions
+// nominated in one cycle.
+func (c *Cache) AddOrUpdateWorkloads(log logr.Logger, ws []*kueue.Workload) []bool {
+	results := make([]bool, len(ws))
+	if len(ws) == 0 {
+		return results
+	}
+	c.Lock()
+	defer c.Unlock()
+	for i, w := range ws {
+		updated, err := c.addOrUpdateWorkloadWithoutLock(log, w)
+		if err != nil {
+			log.Error(err, "Updating workload in cache (batched)", "workload", workload.Key(w))
+		}
+		results[i] = updated
+	}
+	return results
+}
+
 func (c *Cache) addOrUpdateWorkloadWithoutLock(log logr.Logger, wl *kueue.Workload) (bool, error) {
 	wlKey := workload.Key(wl)
 	assignedCqName, assigned := c.workloadAssignedQueues[wlKey]

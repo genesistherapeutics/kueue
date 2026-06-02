@@ -285,6 +285,13 @@ func (s *Scheduler) schedule(ctx context.Context) wait.SpeedSignal {
 	phaseStartTime = s.clock.Now()
 	preemptedWorkloads := make(preemption.PreemptedWorkloads)
 	skippedPreemptions := make(map[kueue.ClusterQueueReference]int)
+	// Parallel slices accumulating one cycle's nominated admissions so we
+	// can commit them to the cache in a single batched lock acquisition
+	// after the loop, instead of pulsing the cache write lock once per
+	// admission. Mirrors the batch-delete fix on the writer side.
+	var toAdmit []*entry
+	var toAdmitAdmissions []*kueue.Admission
+	var toAdmitConsideredStrs []string
 	for iterator.hasNext() {
 		e := iterator.pop()
 
@@ -417,8 +424,25 @@ func (s *Scheduler) schedule(ctx context.Context) wait.SpeedSignal {
 		}
 
 		e.status = nominated
-		if err := s.admit(ctx, e, cq); err != nil {
-			e.inadmissibleMsg = fmt.Sprintf("Failed to admit workload: %v", err)
+		toAdmit = append(toAdmit, e)
+		toAdmitAdmissions = append(toAdmitAdmissions, &kueue.Admission{
+			ClusterQueue:      e.ClusterQueue,
+			PodSetAssignments: e.assignment.ToAPI(),
+		})
+		toAdmitConsideredStrs = append(toAdmitConsideredStrs, flavorassigner.FormatFlavorAssignmentAttemptsForEvents(e.assignment))
+	}
+
+	// 5b. Batch-commit nominated admissions to cache in one write-lock
+	// acquisition, then dispatch their async API patches.
+	if len(toAdmit) > 0 {
+		cacheWls := s.assumeWorkloads(ctx, toAdmit, toAdmitAdmissions)
+		for i, cacheWl := range cacheWls {
+			if cacheWl == nil {
+				toAdmit[i].inadmissibleMsg = fmt.Sprintf("Workload %s/%s could not be added to the cache",
+					toAdmit[i].Obj.Namespace, toAdmit[i].Obj.Name)
+				continue
+			}
+			s.dispatchAdmissionPatch(ctx, toAdmit[i], toAdmitAdmissions[i], cacheWl, toAdmitConsideredStrs[i])
 		}
 	}
 
@@ -689,23 +713,43 @@ func updateAssignmentForTAS(log logr.Logger, snapshot *schdcache.Snapshot, cq *s
 	}
 }
 
-// admit sets the admitting clusterQueue and flavors into the workload of
-// the entry, and asynchronously updates the object in the apiserver after
-// assuming it in the cache.
-// Note: this does not necessarily make the workload "admitted".
-func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQueueSnapshot) error {
+// assumeWorkloads commits a batch of admissions to the cache under one
+// write-lock acquisition. Returns one *Workload per input entry: non-nil
+// on successful commit (and used by dispatchAdmissionPatch); nil if the
+// commit failed (rare; e.g. CQ deleted between snapshot and flush).
+// Mutates entry.status to assumed for successfully-committed entries.
+func (s *Scheduler) assumeWorkloads(ctx context.Context, items []*entry, admissions []*kueue.Admission) []*kueue.Workload {
 	log := ctrl.LoggerFrom(ctx)
-	admission := &kueue.Admission{
-		ClusterQueue:      e.ClusterQueue,
-		PodSetAssignments: e.assignment.ToAPI(),
+	cacheWls := make([]*kueue.Workload, len(items))
+	for i, e := range items {
+		cacheWls[i] = e.Obj.DeepCopy()
+		s.prepareWorkload(log, cacheWls[i], e.clusterQueueSnapshot, admissions[i])
 	}
-
-	consideredStr := flavorassigner.FormatFlavorAssignmentAttemptsForEvents(e.assignment)
-	cacheWl, err := s.assumeWorkload(log, e, cq, admission)
-	if err != nil {
-		return err
+	results := s.cache.AddOrUpdateWorkloads(log, cacheWls)
+	for i, ok := range results {
+		if !ok {
+			cacheWls[i] = nil
+			continue
+		}
+		items[i].status = assumed
+		log.V(2).Info("Workload assumed in the cache", "workload", klog.KObj(items[i].Obj))
+		if afs.Enabled(s.admissionFairSharing) {
+			s.updateEntryPenalty(log, items[i], add)
+			// Trigger LocalQueue reconciler to apply any pending penalties
+			s.queues.NotifyWorkloadUpdateWatchers(items[i].Obj, cacheWls[i])
+		}
 	}
+	return cacheWls
+}
 
+// dispatchAdmissionPatch fires the async Workload-status PATCH that records
+// QuotaReservation + Admitted on the API server. On patch failure, rolls
+// back the cache commit so the workload becomes eligible for re-admission.
+// Body unchanged from the old admit() — just lifted out so the batched
+// commit path can call it per entry.
+func (s *Scheduler) dispatchAdmissionPatch(ctx context.Context, e *entry, admission *kueue.Admission, cacheWl *kueue.Workload, consideredStr string) {
+	log := ctrl.LoggerFrom(ctx)
+	cq := e.clusterQueueSnapshot
 	newWorkload := e.Obj.DeepCopy()
 	s.admissionRoutineWrapper.Run(func() {
 		err := workload.PatchAdmissionStatus(ctx, s.client, newWorkload, s.clock, func(wl *kueue.Workload) (bool, error) {
@@ -717,9 +761,7 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQu
 			return true, nil
 		}, workload.WithLooseOnApply(), workload.WithRetryOnConflictForPatch())
 		if err == nil {
-			// Record metrics and events for quota reservation and admission
 			s.recordWorkloadAdmissionMetrics(log, newWorkload, e.Obj, admission, consideredStr)
-
 			log.V(2).Info("Workload successfully admitted and assigned flavors", "assignments", admission.PodSetAssignments)
 			return
 		}
@@ -734,12 +776,9 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQu
 			log.V(2).Info("Workload not admitted because it was deleted")
 			return
 		}
-
 		log.Error(err, errCouldNotAdmitWL)
 		s.requeueAndUpdate(ctx, *e)
 	})
-
-	return nil
 }
 
 func (s *Scheduler) prepareWorkload(log logr.Logger, wl *kueue.Workload, cq *schdcache.ClusterQueueSnapshot, admission *kueue.Admission) {
@@ -748,24 +787,6 @@ func (s *Scheduler) prepareWorkload(log logr.Logger, wl *kueue.Workload, cq *sch
 		// sync Admitted, ignore the result since an API update is always done.
 		_ = workload.SyncAdmittedCondition(wl, s.clock.Now())
 	}
-}
-
-func (s *Scheduler) assumeWorkload(log logr.Logger, e *entry, cq *schdcache.ClusterQueueSnapshot, admission *kueue.Admission) (*kueue.Workload, error) {
-	cacheWl := e.Obj.DeepCopy()
-	s.prepareWorkload(log, cacheWl, cq, admission)
-	if added := s.cache.AddOrUpdateWorkload(log, cacheWl); !added {
-		return nil, fmt.Errorf("workload %s/%s could not be added to the cache", cacheWl.Namespace, cacheWl.Name)
-	}
-
-	e.status = assumed
-	log.V(2).Info("Workload assumed in the cache")
-
-	if afs.Enabled(s.admissionFairSharing) {
-		s.updateEntryPenalty(log, e, add)
-		// Trigger LocalQueue reconciler to apply any pending penalties
-		s.queues.NotifyWorkloadUpdateWatchers(e.Obj, cacheWl)
-	}
-	return cacheWl, nil
 }
 
 // entryInterator defines order that entries are returned.
