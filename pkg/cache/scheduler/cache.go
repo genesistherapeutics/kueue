@@ -738,6 +738,45 @@ func (c *Cache) DeleteWorkload(log logr.Logger, wlKey workload.Reference) error 
 	return nil
 }
 
+// DeleteWorkloads removes a batch of workloads from the cache under a single
+// write-lock acquisition. Returns one error per input key in the same order;
+// nil means success or "not assigned" (idempotent). This exists so callers
+// faced with bursts of deletes (e.g. cloud-queue's queue_entry_missing reaper)
+// can reduce lock-pulse rate on the cache mutex, which in turn keeps the
+// scheduler's Snapshot() RLock from being starved under Go's RWMutex
+// writer-priority semantics.
+func (c *Cache) DeleteWorkloads(log logr.Logger, wlKeys []workload.Reference) []error {
+	errs := make([]error, len(wlKeys))
+	if len(wlKeys) == 0 {
+		return errs
+	}
+
+	c.Lock()
+	defer c.Unlock()
+
+	anyDeleted := false
+	for i, wlKey := range wlKeys {
+		cqName, assigned := c.workloadAssignedQueues[wlKey]
+		if !assigned {
+			continue
+		}
+		cq := c.hm.ClusterQueue(cqName)
+		if cq == nil {
+			errs[i] = ErrCqNotFound
+			continue
+		}
+		cq.forgetWorkload(log, wlKey)
+		delete(c.workloadAssignedQueues, wlKey)
+		anyDeleted = true
+	}
+
+	if anyDeleted && c.podsReadyTracking {
+		c.podsReadyCond.Broadcast()
+	}
+
+	return errs
+}
+
 func (c *Cache) IsAdded(w workload.Info) bool {
 	c.RLock()
 	defer c.RUnlock()
