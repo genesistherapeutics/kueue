@@ -257,62 +257,6 @@ func TestDeleteWorkloads_ConcurrentReadsDontDeadlock(t *testing.T) {
 	}
 }
 
-// newEmptyCacheWithCQ returns a Cache with one ClusterQueue "cq" and N
-// quota-reserved Workload objects that have NOT yet been added. Use this
-// in the add-side benchmark so each iteration starts with an empty cache.
-func newEmptyCacheWithCQ(t testing.TB, n int) (*Cache, []*kueue.Workload) {
-	t.Helper()
-	ctx, log := utiltesting.ContextWithLog(t)
-	cl := utiltesting.NewFakeClient()
-	c := New(cl)
-
-	c.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
-	cq := utiltestingapi.MakeClusterQueue("cq").
-		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").
-			Resource(corev1.ResourceCPU, "1000000").Obj()).
-		NamespaceSelector(nil).Obj()
-	if err := c.AddClusterQueue(ctx, cq); err != nil {
-		t.Fatalf("AddClusterQueue: %v", err)
-	}
-
-	now := time.Now()
-	ws := make([]*kueue.Workload, n)
-	for i := range ws {
-		ws[i] = utiltestingapi.MakeWorkload(fmt.Sprintf("wl-%d", i), "").
-			PodSets(*utiltestingapi.MakePodSet("main", 1).
-				Request(corev1.ResourceCPU, "1m").Obj()).
-			SimpleReserveQuota("cq", "default", now).Obj()
-	}
-	return c, ws
-}
-
-// BenchmarkAddOrUpdateWorkloads_RawThroughput — same caveat as the delete
-// variant: this is NOT a contention benchmark. It documents that the
-// batched method has comparable per-workload cost to the loop, plus
-// amortises the lock acquisition over the batch. The production win
-// (reduced reader-starvation probability) shows up in production via
-// kueue_admission_attempt_duration_seconds, not here.
-func BenchmarkAddOrUpdateWorkloads_RawThroughput(b *testing.B) {
-	const n = 1000
-	for _, shape := range []string{"Single", "Batch"} {
-		b.Run(shape, func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				b.StopTimer()
-				c, ws := newEmptyCacheWithCQ(b, n)
-				_, log := utiltesting.ContextWithLog(b)
-				b.StartTimer()
-				if shape == "Single" {
-					for _, w := range ws {
-						_ = c.AddOrUpdateWorkload(log, w)
-					}
-				} else {
-					_ = c.AddOrUpdateWorkloads(log, ws)
-				}
-			}
-		})
-	}
-}
-
 // BenchmarkDeleteWorkloads_RawThroughput is intentionally NOT a contention
 // benchmark — micro-benchmarks of RWMutex starvation are notoriously
 // difficult to reproduce because Go's scheduler interleaves writers and
