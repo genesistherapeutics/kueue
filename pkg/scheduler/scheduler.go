@@ -713,18 +713,6 @@ func updateAssignmentForTAS(log logr.Logger, snapshot *schdcache.Snapshot, cq *s
 	}
 }
 
-// admit sets the admitting clusterQueue and flavors into the workload of
-// the entry, and asynchronously updates the object in the apiserver after
-// assuming it in the cache.
-// Note: this does not necessarily make the workload "admitted".
-func (s *Scheduler) prepareWorkload(log logr.Logger, wl *kueue.Workload, cq *schdcache.ClusterQueueSnapshot, admission *kueue.Admission) {
-	workload.SetQuotaReservation(wl, admission, s.clock)
-	if workload.HasAllRequiredChecks(log, wl, cq.AdmissionChecks) {
-		// sync Admitted, ignore the result since an API update is always done.
-		_ = workload.SyncAdmittedCondition(wl, s.clock.Now())
-	}
-}
-
 // assumeWorkloads commits a batch of admissions to the cache under one
 // write-lock acquisition. Returns one *Workload per input entry: non-nil
 // on successful commit (and used by dispatchAdmissionPatch); nil if the
@@ -791,6 +779,14 @@ func (s *Scheduler) dispatchAdmissionPatch(ctx context.Context, e *entry, admiss
 		log.Error(err, errCouldNotAdmitWL)
 		s.requeueAndUpdate(ctx, *e)
 	})
+}
+
+func (s *Scheduler) prepareWorkload(log logr.Logger, wl *kueue.Workload, cq *schdcache.ClusterQueueSnapshot, admission *kueue.Admission) {
+	workload.SetQuotaReservation(wl, admission, s.clock)
+	if workload.HasAllRequiredChecks(log, wl, cq.AdmissionChecks) {
+		// sync Admitted, ignore the result since an API update is always done.
+		_ = workload.SyncAdmittedCondition(wl, s.clock.Now())
+	}
 }
 
 // entryInterator defines order that entries are returned.
