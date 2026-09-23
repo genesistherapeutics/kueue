@@ -20,6 +20,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -51,6 +52,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/util/priority"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
 	"sigs.k8s.io/kueue/pkg/util/routine"
+	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 	"sigs.k8s.io/kueue/pkg/workload"
 )
 
@@ -487,12 +489,159 @@ func runSecondFsStrategy(retryCandidates []*workload.Info, preemptionCtx *preemp
 	return false, targets
 }
 
+// tasDomainOrder carries the candidate ordering and the per-domain retry groups.
+type tasDomainOrder struct {
+	ranks  map[workload.Reference]int
+	viable [][]*workload.Info
+}
+
+// tasDomainRank orders fair-sharing preemption candidates by topology so that
+// victims which free the same domain are considered together. Domains that can
+// host the preemptor come first, and among those the ones needing the fewest
+// evictions -- counting the domain's existing free capacity -- come first, so a
+// partly-free host is preferred over a fully-packed one. CandidatesOrdering has
+// no topology term, so otherwise victims come out spread across domains and a
+// workload needing a whole domain never fits even when a preemptable set that
+// frees one exists (kubernetes-sigs/kueue#10497). Returns nil when the preemptor
+// has no TAS request, leaving non-TAS preemption unchanged. Only reorders the
+// candidates findCandidates already deemed preemptable, so nothing new becomes a
+// target.
+func tasDomainRank(candidates []*workload.Info, tasRequests schdcache.WorkloadTASRequests, preemptorCQ *schdcache.ClusterQueueSnapshot) *tasDomainOrder {
+	if len(tasRequests) == 0 {
+		return nil
+	}
+	// need[flavor] is the preemptor's whole request in that flavor: the amount a
+	// single domain must hold to host it.
+	need := make(map[kueue.ResourceFlavorReference]resources.Requests, len(tasRequests))
+	for flavor, podSets := range tasRequests {
+		total := resources.CreateEmpty()
+		for _, ps := range podSets {
+			total.Add(ps.TotalRequests())
+		}
+		need[flavor] = total
+	}
+	type domainKey struct {
+		flavor kueue.ResourceFlavorReference
+		domain utiltas.TopologyDomainID
+	}
+	free := make(map[domainKey]resources.Requests)
+	for flavor := range need {
+		if tasFlavor := preemptorCQ.TASFlavors[flavor]; tasFlavor != nil {
+			for domain, capacity := range tasFlavor.RemainingCapacityPerDomain() {
+				free[domainKey{flavor: flavor, domain: domain}] = capacity
+			}
+		}
+	}
+	freed := make(map[domainKey]resources.Requests)
+	members := make(map[domainKey][]*workload.Info)
+	occupies := make(map[workload.Reference][]domainKey, len(candidates))
+	for _, c := range candidates {
+		key := workload.Key(c.Obj)
+		for flavor, domainRequests := range c.TASUsage() {
+			if _, contended := need[flavor]; !contended {
+				continue
+			}
+			for _, dr := range domainRequests {
+				dk := domainKey{flavor: flavor, domain: utiltas.DomainID(dr.Values)}
+				if freed[dk] == nil {
+					freed[dk] = resources.CreateEmpty()
+				}
+				freed[dk].Add(dr.TotalRequests())
+				members[dk] = append(members[dk], c)
+				occupies[key] = append(occupies[key], dk)
+			}
+		}
+	}
+	// coverage is the mean fraction of the preemptor's per-domain need this domain
+	// could hold with its free capacity plus its preemptable pods, capped at 1 per
+	// resource; coverage 1 means the domain can host the preemptor.
+	available := func(dk domainKey, res corev1.ResourceName) int64 {
+		var a int64
+		if free[dk] != nil {
+			a += free[dk].GetValue(res)
+		}
+		if freed[dk] != nil {
+			a += freed[dk].GetValue(res)
+		}
+		return a
+	}
+	coverage := func(dk domainKey) float64 {
+		want := need[dk.flavor]
+		if want.Len() == 0 {
+			return 0
+		}
+		var total float64
+		want.ForEach(func(res corev1.ResourceName, v int64) {
+			if v > 0 {
+				total += min(float64(available(dk, res))/float64(v), 1)
+			}
+		})
+		return total / float64(want.Len())
+	}
+	// deficit is how much of the need the domain's free capacity does not already
+	// cover, i.e. the amount that must be preempted -- smaller means fewer evictions.
+	deficit := func(dk domainKey) int64 {
+		var d int64
+		need[dk.flavor].ForEach(func(res corev1.ResourceName, v int64) {
+			var f int64
+			if free[dk] != nil {
+				f = free[dk].GetValue(res)
+			}
+			d += max(0, v-f)
+		})
+		return d
+	}
+	domains := slices.Collect(maps.Keys(freed))
+	slices.SortFunc(domains, func(a, b domainKey) int {
+		return cmp.Or(
+			cmp.Compare(coverage(b), coverage(a)),
+			cmp.Compare(deficit(a), deficit(b)),
+			cmp.Compare(a.flavor, b.flavor),
+			cmp.Compare(a.domain, b.domain),
+		)
+	})
+	domainRank := make(map[domainKey]int, len(domains))
+	for i, dk := range domains {
+		domainRank[dk] = i
+	}
+	// A candidate ranks by its best (lowest-ranked) contended domain; candidates
+	// in no contended domain sort last.
+	ranks := make(map[workload.Reference]int, len(candidates))
+	for _, c := range candidates {
+		key := workload.Key(c.Obj)
+		best := len(domains)
+		for _, dk := range occupies[key] {
+			best = min(best, domainRank[dk])
+		}
+		ranks[key] = best
+	}
+	// viable seeds the domain-scoped retry: the share-based pass can spend a
+	// queue's borrowing budget across several domains and finish none, so a retry
+	// confined to one host-fitting domain forces convergence.
+	// Only domains that could host the whole preemptor (coverage 1) are worth a
+	// scoped retry; the list is naturally bounded to those, best first.
+	var viable [][]*workload.Info
+	for _, dk := range domains {
+		if coverage(dk) < 1 {
+			break
+		}
+		viable = append(viable, members[dk])
+	}
+	return &tasDomainOrder{ranks: ranks, viable: viable}
+}
+
 func (p *Preemptor) fairPreemptions(preemptionCtx *preemptionCtx, strategies []fairsharing.Strategy) []*Target {
 	candidates := p.findCandidates(preemptionCtx.log, preemptionCtx.preemptor.Obj, preemptionCtx.preemptorCQ, preemptionCtx.frsNeedPreemption)
 	if len(candidates) == 0 {
 		return nil
 	}
+	order := tasDomainRank(candidates, preemptionCtx.tasRequests, preemptionCtx.preemptorCQ)
 	slices.SortFunc(candidates, func(a, b *workload.Info) int {
+		if order != nil {
+			if d := cmp.Compare(order.ranks[workload.Key(a.Obj)], order.ranks[workload.Key(b.Obj)]); d != 0 {
+				return d
+			}
+		}
 		return preemptioncommon.CandidatesOrdering(preemptionCtx.log, p.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, p.clock.Now())
 	})
 	if logV := preemptionCtx.log.V(5); logV.Enabled() {
@@ -507,6 +656,25 @@ func (p *Preemptor) fairPreemptions(preemptionCtx *preemptionCtx, strategies []f
 		)
 	}
 
+	if targets := p.runFsStrategies(preemptionCtx, candidates, strategies); targets != nil {
+		return targets
+	}
+	// The queue ordering is share-based, so one pass can spend a queue's whole
+	// borrowing budget across several domains and finish none. Retry confined to
+	// one host-fitting domain at a time to force convergence.
+	if order != nil {
+		for _, scoped := range order.viable {
+			if targets := p.runFsStrategies(preemptionCtx, scoped, strategies); targets != nil {
+				return targets
+			}
+		}
+	}
+	return nil
+}
+
+// runFsStrategies runs the configured fair sharing strategies over one candidate
+// set, returning the targets that admit the preemptor, or nil when none do.
+func (p *Preemptor) runFsStrategies(preemptionCtx *preemptionCtx, candidates []*workload.Info, strategies []fairsharing.Strategy) []*Target {
 	// DRS values must include incoming workload.
 	revertSimulation := preemptionCtx.preemptorCQ.SimulateUsageAddition(preemptionCtx.workloadUsage)
 
