@@ -349,6 +349,18 @@ func (s *TASFlavorSnapshot) removeTASUsage(domainID utiltas.TopologyDomainID, us
 	s.leaves[domainID].cachedRemainingCapacity = resources.LazyRequests{}
 }
 
+// RemainingCapacityPerDomain exposes each leaf topology domain's schedulable free
+// capacity (node capacity minus non-TAS and TAS usage), for preemption victim
+// selection to prefer domains that fit with fewer evictions. The returned
+// Requests are the snapshot's own cached values; callers read them only.
+func (s *TASFlavorSnapshot) RemainingCapacityPerDomain() map[utiltas.TopologyDomainID]resources.Requests {
+	remaining := make(map[utiltas.TopologyDomainID]resources.Requests, len(s.leaves))
+	for domainID, leaf := range s.leaves {
+		remaining[domainID] = s.getRemainingCapacity(leaf)
+	}
+	return remaining
+}
+
 func (s *TASFlavorSnapshot) freeCapacityPerDomain() map[utiltas.TopologyDomainID]resources.Requests {
 	freeCapacityPerDomain := make(map[utiltas.TopologyDomainID]resources.Requests, len(s.leaves))
 
